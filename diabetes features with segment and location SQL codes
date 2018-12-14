@@ -1,0 +1,156 @@
+------------------------------------------------------------------------------------------------------
+----------------------------------------drop everything------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+drop table ds.public.location_prep0;
+drop table ds.public.location_prep_sub_cat0;
+drop table ds.public.location_prep_all0;
+drop table ds.public.location_prep_sub_cat0;
+drop table ds.public.location_id0;
+drop table ds.public.segment_location_id_ref0;
+drop table ds.public.location_seg_taxonomies0;
+
+drop table ds.diabetes1203.location_visit1_0; 
+drop table ds.diabetes1203.location_visit2_0; 
+drop table ds.diabetes1203.location_visit3_0;
+drop table ds.diabetes1203.diab_seg_temp1_0;
+drop table ds.diabetes1203.diab_seg_temp2_0;
+drop table ds.diabetes1203.diab_seg_temp_new_id_0;  
+
+------------------------------------------------------------------------------------------------------
+--------------------------------location data prep ---------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+--------------------------------location and ID  ----------------------------------------------------
+--find out all location histories and location sub categories in 2018 (they are the location features) and put in a table
+--name above table with following header: category_new and segment_name_new
+
+--location category as features
+create table ds.public.location_prep0 as
+select distinct  'LOCATION' category_new, category_name segment_name_new
+from DS.PUBLIC.TRANSACTION_WITH_LOCATION_V3_minhav_unique
+where timestamp>='2018-01-01';
+
+--location sub categories (displayed name) as features 
+create table ds.public.location_prep_sub_cat0 as
+select distinct concat('LOCATION: ', category_name) category_new, displayed_name SEGMENT_NAME_NEW
+from DS.PUBLIC.TRANSACTION_WITH_LOCATION_V3_minhav_unique 
+where 
+timestamp>='2018-01-01';
+
+--union location category and sub categories into one table 
+create table ds.public.location_prep_all0 as
+(select * from ds.public.location_prep_sub_cat0)
+union
+(select * from ds.public.location_prep0)
+
+--assign IDs to the locations  in above table match with the format of segment ID table (segment id new is the same as segment id) 
+create table ds.public.location_id0 as
+select *, dense_rank() over (order by category_new, segment_name_new) +1000 as SEGMENT_ID_NEW
+from ds.public.location_prep_all0;
+
+--------------------------creating table referencing new and old ID including both location and segment ----------------------- 
+--create location ref table 
+create table ds.public.location_id_ref0 as
+select segment_id_new segment_id, segment_id_new from ds.public.location_id0;
+
+--rename location_id_ref table      
+alter table ds.public.location_id_ref0 rename to ds.public.segment_location_id_ref0; 
+
+--insert segment ref table into location ref table (named changed)
+insert into ds.public.segment_location_id_ref0  
+select * from ds.public._v3_taxonomies_stage3_id_reference;
+
+-------------------------create new table referencing new id and segment name (both location and segment )--------------------------------
+--clone segment ref table 
+create table ds.public.location_seg_taxonomies0 clone ds.public._v3_taxonomies_stage3;
+
+--insert location to segment 
+insert into ds.public.location_seg_taxonomies0 
+select * from ds.public.location_id0;
+
+------------------------------------------------------------------------------------------------------
+---------------------------------diabetes data ----------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+--------------------------------create the whole diabetes universe ----------------------------------------------------
+--compute number of devices that clicked on diabetes campaign ad data in Q1
+select count(distinct c.device_id_hashed)
+from etl.public.transactions c
+where c.event_type in ('CLICK', 'EXPAND')
+      and c.campaign_id in (1196,5082,1192,1207,2216,3346,12018,2788,1793,1859,10350,1163,9520,3436,2971,5443,5276,4444,11086,4814,1457,2608,2756,2164,3340,2027,5707,5949,2224,4752,4341,3212,7051,1944,2963,3329,3439,4012,3420,4225,4128,4683,4099,4648,4220)
+      and c.timestamp>='2018-01-01' and c.timestamp<='2018-03-01'
+      and c.device_id_hashed not in (select device_id_hashed from development.hcp_lookup.hcps_past_year)
+; 
+
+
+---create table with devices that clicked on diabetes campaigns in time period that are not HCPs 
+create table ds.diabetes1203.diab_seg_temp as
+select distinct c.device_id_hashed, d.segment_id
+from etl.public.transactions c
+    join development.public._v3_device_segment_clustered d
+        on c.device_id_hashed=d.device_id_hashed
+        and c.event_type in ('CLICK', 'EXPAND')
+        and c.campaign_id in (1196,5082,1192,1207,2216,3346,12018,2788,1793,1859,10350,1163,9520,3436,2971,5443,5276,4444,11086,4814,1457,2608,2756,2164,3340,2027,5707,5949,2224,4752,4341,3212,7051,1944,2963,3329,3439,4012,3420,4225,4128,4683,4099,4648,4220)
+        and c.timestamp>='2018-01-01' and c.timestamp<='2018-03-01'
+        and c.device_id_hashed not in (select device_id_hashed from development.hcp_lookup.hcps_past_year)
+; 
+
+----------------------get device IDs and associated locations ---------------------------------------------------------
+--merge diabetes universe with location history and ref above 
+create table ds.diabetes1203.location_visit1_0 as
+select distinct c.device_id_hashed, category_new, segment_name_new, txn, timestamp 
+from ds.public.transaction_with_location_v3_minhav_unique a
+join ds.diabetes1203.diab_seg_temp c
+    on c.device_id_hashed=a.device_id_hashed
+join ds.public.location_seg_taxonomies0 d
+    on d.segment_name_new = a.category_name
+where (segment_id_new<1000 or segment_name_new in ('COFFEE', 'GYMS', 'FAST FOOD RESTAURANTS')) and
+timestamp>='2018-01-01';
+
+
+--find out devices that have been to above location at least twice in 2018
+create table ds.diabetes1203.location_visit2_0 as
+select device_id_hashed, segment_name_new, number
+from
+(select device_id_hashed, segment_name_new, count(txn) number
+from ds.diabetes1203.location_visit1_0 
+group by device_id_hashed, segment_name_new
+)
+where number>=2; 
+
+--device ID with segment id new for location data 
+create table ds.diabetes1203.location_visit3_0 as 
+select distinct device_id_hashed, segment_id_new as segment_id
+from ds.diabetes1203.location_visit2_0 a
+    join ds.public.location_seg_taxonomies0 b
+        on a.segment_name_new = b.segment_name_new ;
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------put cleaned segment info and location info together ------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+--insert diab segment into location table 
+create table ds.diabetes1203.diab_seg_temp1_0 clone ds.diabetes1203.diab_seg_temp;
+insert into ds.diabetes1203.diab_seg_temp1_0
+select * from ds.diabetes1203.location_visit3_0;
+
+--only include devices that have both segment and location features
+create table ds.diabetes1203.diab_seg_temp2_0 as
+select* from ds.diabetes1203.diab_seg_temp1_0 
+where device_id_hashed in (select a.device_id_hashed
+from ds.diabetes1203.diab_seg_temp a
+join ds.diabetes1203.location_visit3_0 b
+on a.device_id_hashed=b.device_id_hashed)
+      
+
+---------------------------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------- create dataset for clustering ------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------
+-- device id to new seg id (which include location) dataset in long format for clustering 
+create table ds.diabetes1203.diab_seg_temp_new_id_0 as 
+select distinct a.device_id_hashed, b.segment_id_new 
+from ds.diabetes1203.diab_seg_temp2_0 a
+join ds.public.segment_location_id_ref0 b
+on a.segment_id=b.segment_id;
+       
